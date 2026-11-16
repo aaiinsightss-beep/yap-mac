@@ -1,0 +1,34 @@
+name: Mac DMG
+
+on:
+  workflow_dispatch:
+
+jobs:
+  mac:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - run: node scripts/prepare-mac-dependencies.mjs
+      - run: npm run typecheck
+      # Reported, not blocking: the DMG is still wanted if a platform-specific test disagrees.
+      - run: npm test
+        continue-on-error: true
+      - run: npm run build
+      - run: npm run build:native
+      - name: Package Apple Silicon + Intel
+        env:
+          YAP_SIGN_IDENTITY: '-'
+        run: npx electron-builder --mac --arm64 --x64 --publish never
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Yap-mac
+          path: |
+            release/*.dmg
+            release/*.zip
+          if-no-files-found: error

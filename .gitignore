@@ -1,0 +1,39 @@
+node_modules
+dist
+release
+build/native/yap-helper
+*.log
+.env
+.env.*
+.DS_Store
+.vite
+*.dmg
+*.zip
+.firecrawl/
+
+# Local design-tool config
+.impeccable/
+
+# Intermediate icon build product
+build/icons/icon.iconset/
+
+# Private workspace state and local data
+.claude/
+.codex/
+.agents/
+work/
+credentials/
+secrets/
+*.pem
+*.p8
+*.p12
+*.pfx
+*.key
+settings.json
+history.json
+dictionary.json
+corrections.json
+app-rules.json
+audio/
+models/
+screenshots-tmp/

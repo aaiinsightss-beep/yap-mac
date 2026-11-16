@@ -1,0 +1,142 @@
+/* electron-builder afterPack hook (macOS): signs the app.
+
+   macOS remembers privacy permissions (Accessibility, Input Monitoring,
+   Microphone) per code signature. An ad-hoc signature changes with every
+   build, so after an update System Settings still shows Yap as allowed while
+   macOS no longer honours it. Signing every build with the same certificate
+   keeps the permissions across updates.
+
+   electron-builder's own signing is switched off (mac.identity: null),
+   because on Apple Silicon it would fall back to an ad-hoc signature and
+   overwrite this one. Identity, in order of preference:
+     1. YAP_SIGN_IDENTITY
+     2. A "Developer ID Application" certificate in the keychain
+     3. "Yap Self-Signed" from scripts/create-signing-identity.sh
+     4. Ad-hoc: valid, but permissions must be granted again after updates. */
+
+const { execFileSync, spawnSync } = require('node:child_process');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const SELF_SIGNED_NAME = 'Yap Self-Signed';
+const MACH_O_MAGICS = new Set(['feedface', 'feedfacf', 'cefaedfe', 'cffaedfe', 'cafebabe', 'bebafeca']);
+
+function chooseIdentity() {
+  if (process.env.YAP_SIGN_IDENTITY) return { name: process.env.YAP_SIGN_IDENTITY, developerId: process.env.YAP_SIGN_IDENTITY.startsWith('Developer ID Application:') };
+
+  const valid = spawnSync('security', ['find-identity', '-v', '-p', 'codesigning'], { encoding: 'utf8' }).stdout ?? '';
+  const developerId = valid.match(/"(Developer ID Application: [^"]+)"/);
+  if (developerId) return { name: developerId[1], developerId: true };
+
+  const all = spawnSync('security', ['find-identity', '-p', 'codesigning'], { encoding: 'utf8' }).stdout ?? '';
+  if (all.includes(`"${SELF_SIGNED_NAME}"`)) return { name: SELF_SIGNED_NAME, developerId: false };
+
+  return { name: '-', developerId: false };
+}
+
+function isMachO(file) {
+  try {
+    const handle = fs.openSync(file, 'r');
+    const buffer = Buffer.alloc(4);
+    fs.readSync(handle, buffer, 0, 4, 0);
+    fs.closeSync(handle);
+    return MACH_O_MAGICS.has(buffer.toString('hex'));
+  } catch {
+    return false;
+  }
+}
+
+/** Loose binaries outside the standard bundle locations, which --deep does not reach. */
+function findLooseBinaries(directory) {
+  const found = [];
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const full = path.join(directory, entry.name);
+    if (entry.isSymbolicLink()) continue;
+    if (entry.isDirectory()) {
+      found.push(...findLooseBinaries(full));
+    } else if (entry.isFile() && isMachO(full)) {
+      found.push(full);
+    }
+  }
+  return found;
+}
+
+/** Nested .app and .framework bundles, deepest first, so each is sealed after its contents. */
+function findNestedBundles(directory) {
+  const found = [];
+  const walk = (current, depth) => {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      if (entry.isSymbolicLink() || !entry.isDirectory()) continue;
+      const full = path.join(current, entry.name);
+      walk(full, depth + 1);
+      if (/\.(app|framework)$/.test(entry.name)) found.push({ full, depth });
+    }
+  };
+  walk(directory, 0);
+  return found.sort((a, b) => b.depth - a.depth).map((bundle) => bundle.full);
+}
+
+function codesign(target, identity, entitlements, extra = []) {
+  execFileSync(
+    'codesign',
+    [
+      '--force',
+      '--options',
+      'runtime',
+      // Notarisation needs a secure timestamp; everything else must not wait for Apple's server.
+      identity.developerId ? '--timestamp' : '--timestamp=none',
+      '--entitlements',
+      entitlements,
+      ...extra,
+      '--sign',
+      identity.name,
+      target,
+    ],
+    { stdio: 'inherit' },
+  );
+}
+
+exports.default = async function afterPack(context) {
+  if (context.electronPlatformName !== 'darwin') return;
+
+  const appPath = path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`);
+  const asar = require('@electron/asar');
+  const archive = path.join(appPath, 'Contents', 'Resources', 'app.asar');
+  const unexpected = asar.listPackage(archive).find((file) => !/^\/(dist|node_modules)(\/|$)|^\/package\.json$/.test(file));
+  if (unexpected) throw new Error(`Unexpected file in public app archive: ${unexpected}`);
+  const entitlements = path.resolve(__dirname, '..', 'build', 'entitlements.mac.plist');
+  const identity = chooseIdentity();
+  console.log(`[afterPack] signing with ${identity.name === '-' ? 'an ad-hoc signature' : `"${identity.name}"`}`);
+
+  // Inside out: loose binaries first, then the bundles that contain them.
+  // --deep does not reach the Electron Framework libraries (libffmpeg, libEGL, ...)
+  // or Squirrel's ShipIt, and Apple rejects the app when they lack a Developer ID
+  // signature, a secure timestamp or the hardened runtime.
+  const contents = path.join(appPath, 'Contents');
+  const depth = (file) => file.split(path.sep).length;
+  const binaries = [...findLooseBinaries(path.join(contents, 'Frameworks')), ...findLooseBinaries(path.join(contents, 'Resources'))];
+  // Deepest first: a framework's main binary is checked against its Helpers.
+  for (const binary of binaries.sort((a, b) => depth(b) - depth(a))) {
+    codesign(binary, identity, entitlements);
+  }
+  for (const bundle of findNestedBundles(path.join(contents, 'Frameworks'))) {
+    codesign(bundle, identity, entitlements);
+  }
+  codesign(appPath, identity, entitlements, ['--deep']);
+  execFileSync('codesign', ['--verify', '--deep', '--strict', '--verbose=2', appPath], { stdio: 'inherit' });
+
+  if (process.env.YAP_NOTARY_PROFILE) {
+    if (!identity.developerId) throw new Error('Notarization requires a Developer ID Application certificate.');
+    const { notarizeApp } = await import('./notarize.mjs');
+    await notarizeApp(appPath, process.env.YAP_NOTARY_PROFILE, path.resolve(__dirname, '..', 'work', 'notarization'));
+  }
+
+  // The archive cache compares the output directory timestamp, not nested app files.
+  // Refresh it after signing and stapling so update ZIPs contain the current app.
+  const packedAt = new Date();
+  fs.utimesSync(context.appOutDir, packedAt, packedAt);
+
+  if (identity.name === '-') {
+    console.log('[afterPack] Ad-hoc signed. Run scripts/create-signing-identity.sh once so permissions survive updates.');
+  }
+};
